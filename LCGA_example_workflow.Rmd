@@ -1,0 +1,550 @@
+---
+title: "20251205_LCGA_Tutorial"
+# output:
+#   html_document:
+#     toc: true
+#     toc_float: true
+#     number_sections: true
+#     theme: flatly
+#     highlight: tango
+#     df_print: paged
+# date: "2025-12-05"
+output:
+  md_document:
+    variant: markdown_github
+    toc: yes
+    number_sections: true
+editor_options:
+  chunk_output_type: console
+always_allow_html: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+This is a quick overview of Latent Class Growth Analyses (LCGA) or, as the lab calls them, Growth Mixture Models (GMM). Briefly, these are models that can be used to identify latent subgroups, classes or clusters of individuals based on their common growth trajectories over time. Refer to this paper for more information on LCGA/GMM models (https://compass.onlinelibrary.wiley.com/doi/10.1111/j.1751-9004.2007.00054.x). Most of (if not all) the methods to produce the LCGA or GMM are from this resource (https://osf.io/preprints/psyarxiv/m58wx_v1). These papers can also be found in my box folder for LAMB (~/Library/CloudStorage/Box-Box/20241009_LAMB_analysis/papers/). 
+
+# Getting Started
+
+## Loading R packages and phyloseq object
+First, we need to install/load our packages and data.
+- These data are from the LAMB study, which are airway 16S microbiome data collected from three cohorts (COAST, IIS, and URECA) across 10 years of age. The goal was to find airway microbiome development trajectories and relate them to allergic outcomes such as wheezing, asthma, eczema, and other variables. 
+
+```{r load-packages, message=FALSE, warning=FALSE, echo=F, include=FALSE}
+# Install packages if they aren't already
+packages <- c(
+  "phyloseq","ggplot2","ggpubr","ggnewscale","dplyr","table1","gridExtra",
+  "multcompView","car","sjPlot","survival","coxme","RcmdrPlugin.survival",
+  "emmeans","forestmodel","broom","gtsummary","cowsay"
+)
+
+lapply(packages, function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    library(pkg, character.only = TRUE)
+  }
+})
+
+
+source("~/Library/CloudStorage/Box-Box/general_analysis_scripts/20250103_beta_div_calc_stats_plots.R")
+source("~/Library/CloudStorage/Box-Box/general_analysis_scripts/20250610_LCGA_GMM_GMM2_code.R")
+```
+
+
+```{r, results='asis', message=FALSE, warning=FALSE}
+# Read in data
+phy<-readRDS("~/Library/CloudStorage/Box-Box/20241009_LAMB_analysis/LAMB_16S_processing_files/dada2_combined_runs_final_processing/20250610_lamb_phy_rare_rep_only_FINAL.rds")
+# remove single 11 year sample
+phy<-subset_samples(phy, !(sample_data(phy)$AGE_MOS_BMIZ_BIN==132))
+
+# find subset of OTUs that are dominant genera
+phy_abundance <- tax_glom(phy, taxrank = "Genus")
+phy_relabund <- transform_sample_counts(phy_abundance, function(x) x/sum(x))
+
+# pull out dfs from the phyloseq object
+sam<-data.frame(sample_data(phy_abundance))
+taxa<-data.frame(tax_table(phy_abundance))
+
+# Calculate dominant genus for these six taxa, rest are considered "Other"
+sam$domgen_sum<-
+  factor(
+    
+    ifelse(!(sample_data(phy_abundance)$Genus %in% 
+               c("Moraxella","Streptococcus","Staphylococcus",
+                 "Dolosigranulum","Corynebacterium","Haemophilus")),
+           "Other",
+           sample_data(phy_abundance)$Genus),
+    
+  levels=c("Moraxella","Streptococcus",
+         "Staphylococcus","Dolosigranulum",
+         "Corynebacterium","Haemophilus","Other")
+  )
+
+# merge back to phy object
+sample_data(phy)<-sample_data(sam)
+```
+
+## Calculate beta diversity ordination
+The method I used to create microbiome trajectories was to ordinate the data, take the coordinates of each sample's Principle Component 1 (PC1) and PC2, then you can model each PC versus age to find latent development trajectories. 
+
+First, we ordinate the data. I also included a step to calculate statistics for your variable of interest versus the overall ordination. This can be useful in identifying potential confounding factors that you'll want to adjust or otherwise account for later. 
+- Note that several steps will use custom code located in my Box folder (~/Library/CloudStorage/Box-Box/general_analysis_scripts/). You'll need to be given access to this folder and your R will need to be able to access box--I won't be going over this here, so just a heads up.
+
+```{r, results='hide', fig.show='hide', message=FALSE, warning=FALSE, eval=F}
+## calc beta diversity
+# step 1: calculate PCoA ordination
+temp_beta<-beta_div_calc(phy,
+                         dists = c("bray","sorensen"))
+saveRDS(temp_beta, "~/Library/CloudStorage/Box-Box/general_analysis_scripts/LCGA_LAMB_example/beta_ordination.rds")
+
+# step 2: run PERMANOVA models
+# not run here because we're interested in repeated measures
+test_stats<-beta_div_stats(phy=phy,
+                           model_vars=c("AGE_MOS_BMIZ_BIN","domgen_sum"),
+                           subjectid = "ParticipantID",
+                           dists = c("bray","sorensen"))
+
+# step 2 (alternative) run LME models across PC1 and PC2: 
+temp_stats<-beta_div_stats_lme(phy=phy, 
+                               beta_div_calc=temp_beta, 
+                               model_vars=c("AGE_MOS_BMIZ_BIN","domgen_sum"), 
+                               subjectid="SUBJID",
+                               dists=c("bray","sorensen"))
+saveRDS(temp_stats, "~/Library/CloudStorage/Box-Box/general_analysis_scripts/LCGA_LAMB_example/beta_stats.rds")
+
+# step 3: combine into one output and save
+phy_beta_stats<-list(temp_beta, temp_stats)
+saveRDS(phy_beta_stats,"~/Library/CloudStorage/Box-Box/general_analysis_scripts/LCGA_LAMB_example/beta_ordination_lme.rds")
+```
+
+In the step above, I like to save the output of the beta diversity ordination and my stats to save on compute time downstream. You don't have to do this, but it's more efficient to only compute your ordination and stats once and read those results into R later, just keep in mind you'll have to rerun these steps if you change something in your dataset or methods.
+
+Here, we're going to only use Sorensen for downstream analysis, so we're going to save the coordinates into our sam file for easier access.
+
+```{r, results='hide', fig.show='hide', message=FALSE, warning=FALSE}
+# read in beta diversity ordinations and stats
+temp_beta<-readRDS("~/Library/CloudStorage/Box-Box/general_analysis_scripts/LCGA_LAMB_example/beta_ordination.rds")
+temp_stats<-readRDS("~/Library/CloudStorage/Box-Box/general_analysis_scripts/LCGA_LAMB_example/beta_stats.rds")
+
+# append point coordinates from ordination to sam file for downstream use
+# pull out coordinates, check they're aligned to the sam file
+sor_coord<-temp_beta$sorensen$points
+table(rownames(sam)==rownames(sor_coord))
+
+# merge to sam
+# sorensen
+sam$sorensen_axis1<-sor_coord[,1]
+sam$sorensen_axis2<-sor_coord[,2]
+```
+
+Let's see how our ordinations and stats look.
+
+```{r, results='hide', fig.show='hide', message=FALSE, warning=FALSE}
+# # step 5: plot ordination and stats
+pl<-beta_div_plots(phy = phy,
+                    beta_div = temp_beta,
+                    stats=temp_stats,
+                    model_vars="domgen_sum"
+                   )
+```
+
+```{r, results='hide', message=FALSE, warning=FALSE, fig.width=12, fig.height=10}
+ggarrange(pl[[1]][[1]],
+          pl[[2]][[1]],
+          pl[[3]][[1]],
+          pl[[4]][[1]],
+          common.legend = T
+          )
+
+# output stats table
+tab<-beta_div_stats_table(temp_stats)
+tab
+```
+## Calculating trajectories
+This is wrapper code that goes through stepFlexmix, a programs that allows for testing of several parameters at once and collects the output for us. Note that you can change the number of clusters you search for (below it's from 1-5), the number of reps (increase to 100+), number of iterations (increase to 500+), and the "models" option accepts the terms "lcga", "gmm", and "gmm2".
+- lcga: fixed intercept and slope
+- gmm: random intercepts, fixed slope
+- gmm2: random intercepts and slopes
+
+You can run a model with all of these included (models=c("lcga","gmm","gmm2")) and compare the Baysian Information Criterion (BIC) scores, where lower is better (including in cases where they become negative numbers). Since gmm and gmm2 take a very long time to run, we are not doing it here. However, in this case, LCGA is best so we go with that.
+
+```{r, results='asis', message=FALSE, warning=FALSE, eval=F}
+models_sor_pc1<-lcga_gmm_calc(sam_data=sam,
+                                  y_var="sorensen_axis1",
+                                  age_col="AGE_MOS_BMIZ_BIN",
+                                  models="lcga",
+                                  cluster_min=1, cluster_max=5,
+                                  nrep=10, # increase to 100+
+                                  subjectid = "SUBJID",
+                                  iter.max=50, # increase to 500+
+                                  seed=31415)
+models_sor_pc2<-lcga_gmm_calc(sam_data=sam,
+                                  y_var="sorensen_axis2",
+                                  age_col="AGE_MOS_BMIZ_BIN",
+                                  models="lcga",
+                                  cluster_min=1, cluster_max=5,
+                                  nrep=10, # increase to 100+
+                                  subjectid = "SUBJID",
+                                  iter.max=50, # increase to 500+
+                                  seed=31415)
+
+sor_collect<-list(pc1=models_sor_pc1,
+                 pc2=models_sor_pc2)
+
+saveRDS(sor_collect, "~/Library/CloudStorage/Box-Box/general_analysis_scripts/LCGA_LAMB_example/sorensen_lcga_model.rds")
+```
+
+## Plotting the trajectories
+Now that we've calculated the trajectories along PC1 and PC2, we look at the BIC values for each trajectory level (1-5 in our case). For both PC1 and PC2 we have two trajectories as optimal. We then combine them into one trajectory term for PC1 and PC2, represented here as 1-1, 1-2, 2-1, 2-2.
+
+```{r, results='asis', message=FALSE, warning=FALSE, fig.width=12, fig.height=10}
+# read in LCGA model
+sor_models<-readRDS("/Users/ksugino/Library/CloudStorage/Box-Box/20241009_LAMB_analysis/20241105_LAMB_analysis_code/outputs/20250612_LAMB_sorensen_lcga_models.rds")
+# check for best fitting model
+lcga_gmm_table(models = sor_models$pc1)
+lcga_gmm_table(models = sor_models$pc2)
+
+# pull out cluster 2 for each PC
+sor_pc1<-sor_models$pc1$lcga@models[[2]]@cluster
+sor_pc2<-sor_models$pc2$lcga@models[[2]]@cluster
+# combine PC1 and PC2 clusters into one
+sor_clust<-paste0(sor_pc1, "-",sor_pc2)
+# write to sample data
+sam$sor_clust<-sor_clust
+
+# pull out soresen ord
+ord<-temp_beta$sorensen
+
+p<-plot_ordination_trajectories(sam=sam,
+                              trajectory_name<-"sor_clust",
+                              age_name<-"AGE_MOS_BMIZ_BIN",
+                              pc1_name<-"sorensen_axis1",
+                              pc2_name<-"sorensen_axis2",
+                              id_name<-"SUBJID",
+                              beta_ord<-ord,
+                              point_cols_name<-"domgen_sum",
+                              point_cols_legend<-"Dominant Genus",
+                              trajectory_label<-c("TI","TII","TIII","TIV"),
+                              trajectory_shape=c(21, 22, 23, 24),
+                              trajectory_cols=c("#3884ec", "#57cae3", "#c638ec", "#E07A5F")
+         )
+
+# since we're using ggplot, to some extent we can adjust the plot to fit our needs
+p +
+  scale_fill_brewer(palette="Greens", 
+                    name="Age (Years)", 
+                    labels=c(1,2,3,5,6,7,8,9,10))
+```
+
+### Plotting individual trajectories
+It's a little hard to see the trajectory samples, so let's split them up and replot each trajectory individually. This uses utility code in the LCGA code set
+
+```{r, results='asis', message=FALSE, warning=FALSE, fig.width=15, fig.height=10}
+# subset plots to each cluster trajectory
+c11<-subset_ord(sam=sam, beta_ord=ord,axis1="sorensen_axis1", trajectory_name="sor_clust",
+                axis2="sorensen_axis2",sam_sub = "1-1", age_name<-"AGE_MOS_BMIZ_BIN",
+                trajectory_col="#3884ec",point_cols_name = "domgen_sum")
+c12<-subset_ord(sam=sam, beta_ord=ord,axis1="sorensen_axis1", trajectory_name="sor_clust",
+                axis2="sorensen_axis2",sam_sub = "1-2", age_name<-"AGE_MOS_BMIZ_BIN",
+                trajectory_col="#57cae3",point_cols_name = "domgen_sum")
+c21<-subset_ord(sam=sam, beta_ord=ord,axis1="sorensen_axis1", trajectory_name="sor_clust",
+                axis2="sorensen_axis2",sam_sub = "2-1", age_name<-"AGE_MOS_BMIZ_BIN",
+                trajectory_col="#c638ec",point_cols_name = "domgen_sum")
+c22<-subset_ord(sam=sam, beta_ord=ord,axis1="sorensen_axis1", trajectory_name="sor_clust",
+                axis2="sorensen_axis2",sam_sub = "2-2", age_name<-"AGE_MOS_BMIZ_BIN",
+                trajectory_col="#E07A5F",point_cols_name = "domgen_sum")
+
+ggarrange(c11, c12, c21, c22)
+```
+
+### Plotting trajectories with sample timepoint summary
+And since we're using repeated measures data with a lot a missing data, let's see what the data actually look like within each trajectory across time.
+
+Note that this function below is written to only work with my data structure; sorry!
+
+```{r, results='asis', message=FALSE, warning=FALSE, fig.width=15, fig.height=10}
+# subset plots to each cluster trajectory
+paired_samples<-function(sam, sam_sub){
+  # paired samples by cluster
+  # visualizing the repeated measures sampling
+  sam_temp<-subset(sam, sam$sor_clust==sam_sub)[,c("SUBJID","Study","AGE_MOS_BMIZ_BIN","sor_clust")]
+  test<-reshape2::dcast(sam_temp, SUBJID + Study ~ AGE_MOS_BMIZ_BIN)
+  # convert clusters to 1
+  test[,-c(1:2)][!is.na(test[,-c(1:2)])]<-1
+  
+  # find the number of longitudinal data I have, regardless of actual timepoints
+  test$tot<-rowSums(!is.na(test[,-c(1:2)]))
+  # name the timepoints by pasting together the timepoints
+  temp<-data.frame()
+  for(i in 1:nrow(test)){
+    temp[i,1]<-paste0(ifelse(!is.na(test[i,-c(1:2,12)]),paste(colnames(test[i,-c(1:2,12)])), NA),collapse = "-")
+  }
+  test<-data.frame(test, temp)
+  
+  # summarize
+  rep_meas_summary<- test %>%
+    group_by(Study, V1) %>%   # grouping
+    dplyr::summarise(Freq = n())
+  # merge to larger df
+  temp_merge<-merge(test, rep_meas_summary, by=c("Study","V1"))
+  # remove dupes
+  merge_nodupes<-temp_merge[!duplicated(data.frame(temp_merge$Study,temp_merge$V1)),]
+  # merge_nodupes<-merge_nodupes[-50,]
+  # convert NA to 0 and numbers to 1
+  merge_nodupes[merge_nodupes==0]<-1
+  merge_nodupes[merge_nodupes==(-9)]<-1
+  merge_nodupes[is.na(merge_nodupes)]<-0
+  
+  # hard code this in to fill out column names
+  if(!"X24" %in% colnames(merge_nodupes)){
+    temp<-data.frame(X24=rep(0, nrow(merge_nodupes)))
+    merge_nodupes<-cbind(merge_nodupes, temp)
+  }
+  if(!"X72" %in% colnames(merge_nodupes)){
+    temp<-data.frame(X72=rep(0, nrow(merge_nodupes)))
+    merge_nodupes<-cbind(merge_nodupes, temp)
+  }
+  if(!"X96" %in% colnames(merge_nodupes)){
+    temp<-data.frame(X96=rep(0, nrow(merge_nodupes)))
+    merge_nodupes<-cbind(merge_nodupes, temp)
+  }
+  
+  
+  # melt
+  melted<-reshape2::melt(merge_nodupes,
+                         id.vars = c("V1","Study","Freq","tot"),
+                         measure.vars = c("X12","X24","X36","X60","X72","X84","X96","X108","X120"))
+  
+  # idk why i have to do this, but it only works if I do
+  # I think the melt creates a full matrix (whether the data exists at that timecourse or not)
+  # so value removing value=0 removes any false timeseries data
+  melt_sub<-subset(melted,melted$value==1)
+  melt_sub<-melt_sub[order(melt_sub$Freq,decreasing = T),]
+  
+  n<-ifelse(melt_sub$tot>1, "Repeated","Single")
+  melt_sub$n<-n
+  # rename variable
+  colnames(melt_sub)[5]<-"Age_Months"
+  
+  a<-table1(~ Study | Age_Months, 
+       data=melt_sub,
+       # extra.col=list(`P-value`=pvalue),
+       overall=F,
+       caption = "")
+  
+  a<-tableGrob(data.frame(a))
+  return(a)
+}
+
+rep1<-paired_samples(sam=sam, sam_sub = "1-1")
+rep2<-paired_samples(sam=sam, sam_sub = "1-2")
+rep3<-paired_samples(sam=sam, sam_sub = "2-1")
+rep4<-paired_samples(sam=sam, sam_sub = "2-2")
+
+ggarrange(c11, rep1,ncol = 1, heights = c(2,1))
+ggarrange(c12, rep2,ncol = 1, heights = c(2,1))
+ggarrange(c21, rep3,ncol = 1, heights = c(2,1))
+ggarrange(c22, rep4,ncol = 1, heights = c(2,1))
+
+```
+
+## Trajectories versus fixed measures
+In my data, there are several variables that can be considered fixed, i.e., variables that do not change across time such as sex, delivery mode, and others. Here, we subset the data down to unique participant IDs to analyze fixed effects versus trajectory. 
+
+```{r, results='asis', message=FALSE, warning=FALSE, fig.width=10, fig.height=12}
+pvalue <- function(x, ...) {
+  # Construct vectors of data y, and groups (strata) g
+  y <- unlist(x)
+  g <- factor(rep(1:length(x), times=sapply(x, length)))
+  if (is.numeric(y)) {
+    # For numeric variables, perform a standard 2-sample t-test
+    temp <- aov(y ~ g)
+    p <- summary(temp)[[1]][["Pr(>F)"]][1]
+  } else {
+    # For categorical variables, perform a chi-squared test of independence
+    p <- chisq.test(table(y, g))$p.value
+  }
+  # Format the p-value, using an HTML entity for the less-than sign.
+  # The initial empty string places the output on the line below the variable label.
+  c("", sub("<", "&lt;", format.pval(p, digits=4, eps=0.001)))
+}
+
+# remove missing codes, etc.
+# Edit -9 and -6 values to NA
+temp_sam<-sam
+temp_sam[temp_sam=="-9"]<-NA
+temp_sam[temp_sam=="-6"]<-NA
+temp_sam[temp_sam=="-7"]<-NA
+temp_sam[temp_sam=="-99"]<-NA
+temp_sam[temp_sam=="-5"]<-NA
+
+sam<-temp_sam
+
+# set up repeated measures vairables and fixed variables; collect the latter into one unique df and compare to cluster, the former plot across time.
+static<-c("SUBJID","SEX", "GA_WKS","BWGT_GRAMS", "CSECT", "BREASTFEDDUR","MEDHHINC_ADJ","ANTIBIOTICSEXPOSURE_OY","MAT_ASTHMA", "PAT_ASTHMA", "AR_5_7_YRS", "AR_8_PLUS_YRS","ASTHMA_AGE","ASTHMA_DEF_1","asthma_def_2","sor_clust")
+sam_static<-data.frame(sam[,static])
+sam$sor_clust<-factor(sam$sor_clust, levels=c("2-1","1-1", "1-2", "2-2"))
+# subset down to unique values only (since we don't care about timepoint anymore)
+sam_unique<-sam_static[!duplicated(sam_static$SUBJID),]
+
+# convert vars to formula vars
+f_vars<-paste(static[-1], collapse="+")
+
+table1(as.formula(paste("~", f_vars, "| sor_clust")), 
+       data=sam_unique,
+       extra.col=list(`P-value`=pvalue),
+       overall=F)
+```
+
+## Trajectories versus repeated measures
+Other data are repeated across time, so we have to use mixed effects models to look at the relationship between the variable as an outcome, and trajectory. Note that depending on the outcome variable's type, we need to use either a binomial regression (for 0/1 data) or a standard regression for continuous data.
+
+Note that I'm using age as both a fixed and random effect. The best option for your data may differ, so you can play around with where age is included in this model and compare the model fits (e.g., BIC values) to find the best approach)
+
+```{r, results='asis', message=FALSE, warning=FALSE, fig.width=12, fig.height=10}
+# set up rep meas variables
+reps<-c("SUBJID", "AGE_MOS_BMIZ_BIN","WHEEZING", "ECZEMA", 
+        "BMIZ","asthma_def_recalc", "TIGE","sor_clust")
+
+sam_reps<-data.frame(sam[,reps])
+sam_reps$log_TIGE<-log(sam_reps$TIGE+1)
+sam_reps$AGE_MOS_BMIZ_BIN<-as.numeric(as.character(sam_reps$AGE_MOS_BMIZ_BIN))
+# reorder trajectories
+sam_reps$sor_clust<-factor(sam_reps$sor_clust, levels=c("2-1","1-1","1-2","2-2"))
+
+
+m1<-glmer(data=sam_reps, 
+          formula =  as.formula(WHEEZING ~ sor_clust + AGE_MOS_BMIZ_BIN + (1+AGE_MOS_BMIZ_BIN|SUBJID)), 
+          family="binomial")
+# Anova(m1)
+m2<-glmer(data=sam_reps, 
+          formula =  as.formula(ECZEMA ~ sor_clust + AGE_MOS_BMIZ_BIN + (1+AGE_MOS_BMIZ_BIN|SUBJID)), 
+          family="binomial")
+# Anova(m2)
+m3<-glmer(data=sam_reps, 
+          formula =  as.formula(BMIZ ~ sor_clust + AGE_MOS_BMIZ_BIN + (1+AGE_MOS_BMIZ_BIN|SUBJID)))
+# Anova(m4)
+m4<-lmer(data=sam_reps, 
+         formula =  as.formula(log_TIGE ~ sor_clust + AGE_MOS_BMIZ_BIN + (1+AGE_MOS_BMIZ_BIN|SUBJID)))
+# Anova(m5)
+
+p_tab<-data.frame()
+for(i in 1:4){
+  temp_p<-Anova(get(paste0("m", i)))
+  name<-gsub(".*\\: ","",attributes(temp_p)$heading[2])
+  
+  temp_tab<-data.frame("Variable" = name,
+                        "Model_P-value" = temp_p$`Pr(>Chisq)`[1])
+  p_tab<-rbind(p_tab, temp_tab)
+}
+
+kbl(p_tab) %>%
+  kable_styling(full_width = FALSE)
+```
+
+### Visualizing the results
+So we have one significant term (log_tIGE), but let's take a look at what all these data look like as well as the model outputs. 
+
+```{r, results='asis', message=FALSE, warning=FALSE, fig.width=12, fig.height=10}
+clust_cols<-c("1-1"="#57cae3",
+                  "1-2"="#3884ec",
+                   "2-1"="#c638ec",
+                    "2-2"="#E07A5F")
+
+# plot WHEEZE
+tab_model(m1)
+
+ggplot(sam_reps, aes(x=AGE_MOS_BMIZ_BIN, y=WHEEZING, color=sor_clust, group=sor_clust))+
+  geom_point(position=position_dodge(width = 0.90))+
+  stat_smooth(method="loess", size=1.5, alpha=0.2) +
+  scale_color_manual(values=clust_cols)
+
+# plot ECZEMA
+tab_model(m2)
+
+ggplot(sam_reps, aes(x=AGE_MOS_BMIZ_BIN, y=ECZEMA, color=sor_clust, group=sor_clust))+
+  geom_point(position=position_dodge(width = 0.90))+
+  stat_smooth(method="loess", size=1.5, alpha=0.2) +
+  scale_color_manual(values=clust_cols)
+
+# plot BMIZ
+tab_model(m3)
+
+ggplot(sam_reps, aes(x=AGE_MOS_BMIZ_BIN, y=BMIZ, color=sor_clust, group=sor_clust))+
+  geom_point(position=position_dodge(width = 0.90))+
+  stat_smooth(method="loess", size=1.5, alpha=0.2) +
+  scale_color_manual(values=clust_cols)
+
+
+# plot log_TIGE
+tab_model(m4)
+
+ggplot(sam_reps, aes(x=AGE_MOS_BMIZ_BIN, y=log_TIGE, color=sor_clust, group=sor_clust))+
+  geom_point(position=position_dodge(width = 0.90))+
+  stat_smooth(method="loess", size=1.5, alpha=0.2) +
+  scale_color_manual(values=clust_cols)
+```
+
+## Cox regression of asthma acquisition over time
+The last, and arguably most important, variable we're going to look at is what I've called "asthma_def_recalc". See, we were given "asthma_def_1" and "asthma_def_2", which are essentially both fixed measures indicating whether each person has reported a physician diagnosis of asthma ever. Potentially interesting? Yes. But I feel we can do better. 
+
+In an attempt to create a variable with more granularity than "asthma ever", I took the date of asthma report, converted that to an age, and created a new longitudinal variable for each participant where collection time points before the age of asthma report get a 0, and time points after get a 1; in cases where they never develop asthma they will have all 0 values across all sample time points. 
+
+Now, if you're like me, you thought "of nice, this asthma_def_recalc can be used in a logistic regression to model asthma over time". I think I was very wrong about this assumption since the acquisition of asthma over time isn't an independent event; there is a specific time point after which all 0's switch to 1's. This data modality describes a survival curve, so that's the framework we should be working in. I won't go into details here, but check this resource for more info https://stats.oarc.ucla.edu/wp-content/uploads/2025/02/survival_r_full.html
+
+Note that we're reading in a different dataset than we've been using up to now. This new data takes advantage of the fact that we no longer need the microbiome data for analysis; we've already used the data to calculate microbiome trajectories, so we can merge back to the full set of metadata and use those information regardless of extant microbime measurements. I did not do this for the models above because they crash due to memory limitations, but you can (and should) run the full set of metadata on wynton.
+
+```{r, results='asis', message=FALSE, warning=FALSE, fig.width=12, fig.height=10}
+sam<-read.csv("/Users/ksugino/Library/CloudStorage/Box-Box/general_analysis_scripts/LCGA_LAMB_example/asthma_def_recalc_data.csv")
+
+# subset data to useful columns
+df<-sam[,c("AGE_MOS_BMIZ_BIN","asthma_def_recalc","sor_clust", "SUBJID")]
+# remake sor clust names and such
+colnames(df)<-c("age","asthma","Trajectory","id")
+df$Trajectory<-factor(df$Trajectory, labels=c("I","II","III","IV"))
+
+# resturcture data so we keep only the earliest time to event=1 or the last time to event=0
+surv_df<-df %>%
+  group_by(id) %>%
+  slice(
+    if(any(asthma == 1)) {
+      which.min(ifelse(asthma == 1, age, Inf))
+    } else{
+      which.max(age)
+    }
+  ) %>%
+  ungroup()
+
+
+a<-coxph(Surv(age, asthma) ~ Trajectory 
+         , data = surv_df)
+a |> 
+  tbl_regression(exp = TRUE) 
+ 
+# compare all contrasts
+emm <- emmeans(a, ~ Trajectory)
+kable(pairs(emm, adjust="none"))
+
+# plot asthma def
+ggplot(df, aes(x=age, y=asthma, color=Trajectory, group=Trajectory))+
+  geom_point(stat = "summary",position=position_dodge(width = 0.90))+
+  stat_smooth(method="loess", size=1.5, alpha=0.2) +
+  scale_color_manual(values=as.character(clust_cols)) +
+  labs(y="Asthma acquisition over time",
+       x="Age (Months)")
+```
+
+# Ending Thoughts
+That's more or less the LAMB analysis thus far. I hope this was helpful and that my functions work properly for your use cases. If not, feel free to reach out at my gmail (which you can probably guess if you've seen any of my previous university-affiliated email names). I enjoyed making this and I hope you also find enjoyment in data and coding. To that end, here's some fun packages.
+
+```{r, results='asis', message=FALSE, warning=FALSE, fig.width=12, fig.height=10}
+library("cowsay", quietly = TRUE, warn.conflicts = FALSE)
+say("Q: What do you call a single buffalo?\nA: A buffalonely", by = "buffalo")
+```
+
+```{r, results='asis', message=FALSE, warning=FALSE, fig.width=12, fig.height=10}
+library("fortunes", quietly = TRUE, warn.conflicts = FALSE)
+fortune()
+```
